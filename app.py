@@ -231,7 +231,7 @@ class CRMApp:
         )
         comments_frame = ttk.Frame(form_frame)
         comments_frame.grid(row=3, column=3, columnspan=2, sticky="nsew", pady=3)
-        self.comments_text = tk.Text(comments_frame, width=40, height=5, wrap="word")
+        self.comments_text = tk.Text(comments_frame, width=40, height=5, wrap="word", undo=True, maxundo=256)
         scroll = ttk.Scrollbar(comments_frame, command=self.comments_text.yview)
         self.comments_text.configure(yscrollcommand=scroll.set)
         self.comments_text.grid(row=0, column=0, sticky="nsew")
@@ -346,115 +346,28 @@ class CRMApp:
         self.root.grid_columnconfigure(0, weight=1)
 
     def _bind_shortcuts(self) -> None:
-        """Рабочие хоткеи: ручная копия/вставка/вырез/выделение всего через буфер."""
+        """Хоткеи: используем стандартные бинды, плюс фолбек по keycode для нераспознанных раскладок."""
 
-        def copy(event: tk.Event) -> str | None:
-            w = event.widget
-            handled = False
-            try:
-                cls = w.winfo_class()
-                if cls in ("Entry", "TEntry", "TCombobox"):
-                    text = w.selection_get()
-                    self.root.clipboard_clear()
-                    self.root.clipboard_append(text)
-                    handled = True
-                elif cls == "Text":
-                    text = w.get("sel.first", "sel.last")
-                    self.root.clipboard_clear()
-                    self.root.clipboard_append(text)
-                    handled = True
-            except Exception:
-                handled = False
-            return "break" if handled else None
-
-        def cut(event: tk.Event) -> str | None:
-            w = event.widget
-            handled = False
-            try:
-                cls = w.winfo_class()
-                if cls in ("Entry", "TEntry", "TCombobox"):
-                    text = w.selection_get()
-                    self.root.clipboard_clear()
-                    self.root.clipboard_append(text)
-                    w.delete("sel.first", "sel.last")
-                    handled = True
-                elif cls == "Text":
-                    text = w.get("sel.first", "sel.last")
-                    self.root.clipboard_clear()
-                    self.root.clipboard_append(text)
-                    w.delete("sel.first", "sel.last")
-                    handled = True
-            except Exception:
-                handled = False
-            return "break" if handled else None
-
-        def paste(event: tk.Event) -> str | None:
-            w = event.widget
-            handled = False
-            try:
-                text = self.root.clipboard_get()
-                cls = w.winfo_class()
-                if cls in ("Entry", "TEntry", "TCombobox"):
-                    w.insert(tk.INSERT, text)
-                    handled = True
-                elif cls == "Text":
-                    w.insert(tk.INSERT, text)
-                    handled = True
-            except Exception:
-                handled = False
-            return "break" if handled else None
-
-        def select_all(event: tk.Event) -> str | None:
-            w = event.widget
-            handled = False
-            try:
-                cls = w.winfo_class()
-                if cls in ("Entry", "TEntry", "TCombobox"):
-                    w.select_range(0, tk.END)
-                    w.icursor(tk.END)
-                    handled = True
-                elif cls == "Text":
-                    w.tag_add("sel", "1.0", "end-1c")
-                    w.mark_set("insert", "1.0")
-                    handled = True
-            except Exception:
-                handled = False
-            return "break" if handled else None
-
-        bindings = [
-            ("<Control-c>", copy),
-            ("<Control-C>", copy),
-            ("<Command-c>", copy),
-            ("<Command-C>", copy),
-            ("<Control-Insert>", copy),
-            ("<Control-x>", cut),
-            ("<Control-X>", cut),
-            ("<Command-x>", cut),
-            ("<Command-X>", cut),
-            ("<Shift-Delete>", cut),
-            ("<Control-v>", paste),
-            ("<Control-V>", paste),
-            ("<Shift-Insert>", paste),
-            ("<Command-v>", paste),
-            ("<Command-V>", paste),
-            ("<Control-a>", select_all),
-            ("<Control-A>", select_all),
-            ("<Command-a>", select_all),
-            ("<Command-A>", select_all),
-        ]
-
-        for seq, func in bindings:
-            self.root.bind_all(seq, func, add="+")
-
-        # Фолбек для случаев, когда keysym не распознаётся (в логах видно "??" для C/V/A).
-        # На Windows keycode: C=67, V=86, X=88, A=65.
-        keycode_map = {67: copy, 86: paste, 88: cut, 65: select_all}
+        # Фолбек только когда keysym не распознан (например, "??" при русской раскладке).
+        keycode_map = {
+            67: "<<Copy>>",   # C
+            86: "<<Paste>>",  # V
+            88: "<<Cut>>",    # X
+            65: "<<SelectAll>>",  # A
+            90: "<<Undo>>",   # Z
+        }
 
         def on_ctrl_keycode(event: tk.Event) -> str | None:
-            func = keycode_map.get(event.keycode)
-            if func:
-                result = func(event)
-                return "break" if result == "break" else None
+            # Если keysym нормальный (c, v, x, a, z) — пусть работает дефолтный биндинг Tk.
+            if event.keysym and event.keysym.lower() in ("c", "v", "x", "a", "z"):
+                return None
+            action = keycode_map.get(event.keycode)
+            if action:
+                try:
+                    event.widget.event_generate(action)
+                    return "break"
+                except Exception:
+                    return None
             return None
 
         self.root.bind_all("<Control-KeyPress>", on_ctrl_keycode, add="+")
