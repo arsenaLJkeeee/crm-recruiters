@@ -5,10 +5,12 @@ import sqlite3
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 from tkinter import ttk
 import webbrowser
 import subprocess
+import datetime
+import calendar
 
 
 APP_TITLE = "CRM рекрутеров"
@@ -18,6 +20,7 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "app.log"
 APP_VERSION = "0.0.1"
 KEY_LOGGING = True  # временно для отладки хоткеев
+USE_GMAIL_COMPOSE = True  # если True, открываем сразу Gmail compose вместо mailto (обходит браузерные handlers)
 
 
 def setup_logging() -> None:
@@ -45,6 +48,7 @@ class RecruiterDB:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self._create_table()
+        self._ensure_columns()
 
     def _create_table(self) -> None:
         query = """
@@ -58,31 +62,76 @@ class RecruiterDB:
             email TEXT,
             comments TEXT,
             resume_path TEXT,
+            status TEXT DEFAULT 'первичный контакт',
+            last_contact TEXT,
+            next_step TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """
         self.conn.execute(query)
         self.conn.commit()
 
-    def add_recruiter(self, data: dict) -> None:
+    def _ensure_columns(self) -> None:
+        cursor = self.conn.execute("PRAGMA table_info(recruiters)")
+        cols = {row["name"] for row in cursor.fetchall()}
+        alter_queries = []
+        if "status" not in cols:
+            alter_queries.append("ALTER TABLE recruiters ADD COLUMN status TEXT DEFAULT 'первичный контакт'")
+        if "last_contact" not in cols:
+            alter_queries.append("ALTER TABLE recruiters ADD COLUMN last_contact TEXT")
+        if "next_step" not in cols:
+            alter_queries.append("ALTER TABLE recruiters ADD COLUMN next_step TEXT")
+        for q in alter_queries:
+            self.conn.execute(q)
+        if alter_queries:
+            self.conn.commit()
+
+    def update_recruiter(self, data: dict) -> None:
         query = """
-        INSERT INTO recruiters
-        (company, full_name, telegram, phone, position, email, comments, resume_path)
-        VALUES (:company, :full_name, :telegram, :phone, :position, :email, :comments, :resume_path)
+        UPDATE recruiters
+        SET company = :company,
+            full_name = :full_name,
+            telegram = :telegram,
+            phone = :phone,
+            position = :position,
+            email = :email,
+            comments = :comments,
+            status = :status,
+            last_contact = :last_contact,
+            next_step = :next_step
+        WHERE id = :id
         """
         self.conn.execute(query, data)
         self.conn.commit()
 
-    def fetch_recruiters(self, company_filter: str | None = None) -> list[sqlite3.Row]:
+    def add_recruiter(self, data: dict) -> None:
+        query = """
+        INSERT INTO recruiters
+        (company, full_name, telegram, phone, position, email, comments, status, last_contact, next_step)
+        VALUES (:company, :full_name, :telegram, :phone, :position, :email, :comments, :status, :last_contact, :next_step)
+        """
+        self.conn.execute(query, data)
+        self.conn.commit()
+
+    def fetch_recruiters(self, company_filter: str | None = None, status_filter: str | None = None) -> list[sqlite3.Row]:
+        where = []
+        params: list = []
         if company_filter and company_filter != "Все":
-            cursor = self.conn.execute(
-                "SELECT * FROM recruiters WHERE company = ? ORDER BY created_at DESC",
-                (company_filter,),
-            )
-        else:
-            cursor = self.conn.execute(
-                "SELECT * FROM recruiters ORDER BY created_at DESC"
-            )
+            where.append("company = ?")
+            params.append(company_filter)
+        if status_filter and status_filter != "Все":
+            where.append("status = ?")
+            params.append(status_filter)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        query = f"""
+        SELECT * FROM recruiters
+        {where_sql}
+        ORDER BY
+            CASE WHEN next_step IS NULL OR next_step = '' THEN 1 ELSE 0 END,
+            next_step ASC,
+            created_at DESC
+        """
+        cursor = self.conn.execute(query, params)
         return cursor.fetchall()
 
     def delete_recruiter(self, recruiter_id: int) -> None:
@@ -111,8 +160,12 @@ class CRMApp:
         self.phone_var = tk.StringVar()
         self.position_var = tk.StringVar()
         self.email_var = tk.StringVar()
-        self.resume_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="первичный контакт")
+        self.last_contact_var = tk.StringVar()
+        self.next_step_var = tk.StringVar()
         self.filter_var = tk.StringVar(value="Все")
+        self.filter_status_var = tk.StringVar(value="Все")
+        self.current_edit_id: int | None = None
 
         self._build_ui()
         self._bind_shortcuts()
@@ -143,20 +196,41 @@ class CRMApp:
             entry = ttk.Entry(form_frame, textvariable=var, width=40)
             entry.grid(row=idx, column=1, sticky="ew", pady=3)
 
-        # Resume chooser
-        ttk.Label(form_frame, text="Резюме (PDF)").grid(row=0, column=2, sticky="w", pady=3, padx=(16, 8))
-        ttk.Button(form_frame, text="Загрузить PDF", command=self.choose_resume).grid(
-            row=0, column=3, sticky="w", pady=3
+        # Status and dates
+        ttk.Label(form_frame, text="Статус").grid(row=0, column=2, sticky="w", pady=3, padx=(16, 8))
+        self.status_combo = ttk.Combobox(
+            form_frame,
+            textvariable=self.status_var,
+            state="readonly",
+            values=[
+                "первичный контакт",
+                "ожидание ответа",
+                "интервью",
+                "оффер",
+                "отказ",
+            ],
+            width=28,
         )
-        self.resume_label = ttk.Label(form_frame, textvariable=self.resume_var, foreground="#555")
-        self.resume_label.grid(row=1, column=2, columnspan=2, sticky="w", pady=3, padx=(16, 8))
+        self.status_combo.grid(row=0, column=3, sticky="w", pady=3)
+
+        ttk.Label(form_frame, text="Последний контакт (YYYY-MM-DD)").grid(row=1, column=2, sticky="w", pady=3, padx=(16, 8))
+        ttk.Entry(form_frame, textvariable=self.last_contact_var, width=22).grid(row=1, column=3, sticky="w", pady=3)
+        ttk.Button(form_frame, text="Выбрать", command=lambda: self._pick_date(self.last_contact_var)).grid(
+            row=1, column=4, sticky="w", padx=(4, 0)
+        )
+
+        ttk.Label(form_frame, text="Следующий шаг (YYYY-MM-DD)").grid(row=2, column=2, sticky="w", pady=3, padx=(16, 8))
+        ttk.Entry(form_frame, textvariable=self.next_step_var, width=22).grid(row=2, column=3, sticky="w", pady=3)
+        ttk.Button(form_frame, text="Выбрать", command=lambda: self._pick_date(self.next_step_var)).grid(
+            row=2, column=4, sticky="w", padx=(4, 0)
+        )
 
         # Comments
         ttk.Label(form_frame, text="Комментарии / заметки").grid(
-            row=2, column=2, sticky="nw", pady=3, padx=(16, 8)
+            row=3, column=2, sticky="nw", pady=3, padx=(16, 8)
         )
         comments_frame = ttk.Frame(form_frame)
-        comments_frame.grid(row=2, column=3, sticky="nsew", pady=3)
+        comments_frame.grid(row=3, column=3, columnspan=2, sticky="nsew", pady=3)
         self.comments_text = tk.Text(comments_frame, width=40, height=5, wrap="word")
         scroll = ttk.Scrollbar(comments_frame, command=self.comments_text.yview)
         self.comments_text.configure(yscrollcommand=scroll.set)
@@ -167,12 +241,15 @@ class CRMApp:
 
         # Buttons
         btn_frame = ttk.Frame(form_frame)
-        btn_frame.grid(row=len(labels) + 1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        btn_frame.grid(row=len(labels) + 4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
         ttk.Button(btn_frame, text="Добавить рекрутера", command=self.add_recruiter).grid(
             row=0, column=0, padx=(0, 8)
         )
-        ttk.Button(btn_frame, text="Очистить форму", command=self.clear_form).grid(
+        ttk.Button(btn_frame, text="Сохранить правки", command=self.save_edit).grid(
             row=0, column=1, padx=(0, 8)
+        )
+        ttk.Button(btn_frame, text="Отменить/очистить", command=self.clear_form).grid(
+            row=0, column=2, padx=(0, 8)
         )
 
         # Filter bar
@@ -183,11 +260,20 @@ class CRMApp:
             filter_frame, textvariable=self.filter_var, state="readonly", width=30
         )
         self.filter_combo.grid(row=0, column=1, padx=(0, 12))
+        ttk.Label(filter_frame, text="Статус").grid(row=0, column=2, padx=(0, 8))
+        self.filter_status_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.filter_status_var,
+            state="readonly",
+            width=22,
+            values=["Все", "первичный контакт", "ожидание ответа", "интервью", "оффер", "отказ"],
+        )
+        self.filter_status_combo.grid(row=0, column=3, padx=(0, 12))
         ttk.Button(filter_frame, text="Показать рекрутеров", command=self._refresh_table).grid(
-            row=0, column=2, padx=(0, 8)
+            row=0, column=4, padx=(0, 8)
         )
         ttk.Button(filter_frame, text="Обновить список компаний", command=self._refresh_company_filter).grid(
-            row=0, column=3
+            row=0, column=5
         )
 
         # Table
@@ -202,7 +288,9 @@ class CRMApp:
             "phone",
             "position",
             "email",
-            "resume_path",
+            "status",
+            "last_contact",
+            "next_step",
             "comments",
         )
         self.tree = ttk.Treeview(
@@ -215,7 +303,9 @@ class CRMApp:
             "phone": "Телефон",
             "position": "Должность",
             "email": "Почта",
-            "resume_path": "Резюме",
+            "status": "Статус",
+            "last_contact": "Последний контакт",
+            "next_step": "След. шаг",
             "comments": "Комментарий",
         }
         for col in columns:
@@ -223,8 +313,8 @@ class CRMApp:
                 self.tree.column(col, width=0, stretch=False, anchor="center")
             elif col == "comments":
                 self.tree.column(col, width=220, anchor="w")
-            elif col == "resume_path":
-                self.tree.column(col, width=180, anchor="w")
+            elif col in ("last_contact", "next_step"):
+                self.tree.column(col, width=120, anchor="w")
             elif col == "full_name":
                 self.tree.column(col, width=180, anchor="w")
             else:
@@ -232,6 +322,8 @@ class CRMApp:
             self.tree.heading(col, text=headings.get(col, col))
 
         self.tree.bind("<Double-1>", self.on_tree_double_click)
+        # Отдельный биндинг на клик по email — открывать почту
+        self.tree.tag_configure("email", foreground="#0a5dbd")
 
         tree_scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll_y.set)
@@ -245,9 +337,7 @@ class CRMApp:
         actions = ttk.Frame(self.root, padding=12)
         actions.grid(row=3, column=0, sticky="ew")
         ttk.Button(actions, text="Открыть TG", command=self.open_tg).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(actions, text="Открыть резюме (PDF)", command=self.open_resume).grid(
-            row=0, column=1, padx=(0, 8)
-        )
+        ttk.Button(actions, text="Написать письмо", command=self.open_email).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Удалить выбранного", command=self.delete_recruiter).grid(
             row=0, column=2, padx=(0, 8)
         )
@@ -391,15 +481,6 @@ class CRMApp:
         for virtual in ("<<Copy>>", "<<Cut>>", "<<Paste>>", "<<SelectAll>>"):
             self.root.bind_all(virtual, log_virtual(virtual), add="+")
 
-    def choose_resume(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="Выберите PDF резюме",
-            filetypes=[("PDF", "*.pdf")],
-        )
-        if file_path:
-            self.resume_var.set(Path(file_path).resolve().as_posix())
-            logging.info("Выбрано резюме: %s", file_path)
-
     def add_recruiter(self) -> None:
         data = {
             "company": self.company_var.get().strip(),
@@ -409,7 +490,9 @@ class CRMApp:
             "position": self.position_var.get().strip(),
             "email": self.email_var.get().strip(),
             "comments": self.comments_text.get("1.0", tk.END).strip(),
-            "resume_path": self.resume_var.get().strip(),
+            "status": self.status_var.get().strip() or "первичный контакт",
+            "last_contact": self.last_contact_var.get().strip(),
+            "next_step": self.next_step_var.get().strip(),
         }
 
         if not data["company"]:
@@ -418,12 +501,6 @@ class CRMApp:
         if not data["full_name"]:
             messagebox.showwarning("Поля обязательны", "Укажите ФИО.")
             return
-        if data["resume_path"]:
-            path = Path(data["resume_path"])
-            if path.suffix.lower() != ".pdf" or not path.exists():
-                messagebox.showerror("Резюме", "Укажите существующий PDF файл резюме.")
-                return
-
         try:
             self.db.add_recruiter(data)
             logging.info("Добавлен рекрутер: %s (%s)", data["full_name"], data["company"])
@@ -435,6 +512,38 @@ class CRMApp:
             logging.exception("Ошибка при добавлении рекрутера: %s", exc)
             messagebox.showerror("Ошибка", f"Не удалось сохранить: {exc}")
 
+    def save_edit(self) -> None:
+        if not self.current_edit_id:
+            messagebox.showinfo("Правка", "Сначала выберите запись (двойной клик), чтобы редактировать.")
+            return
+        data = {
+            "id": self.current_edit_id,
+            "company": self.company_var.get().strip(),
+            "full_name": self.full_name_var.get().strip(),
+            "telegram": self.telegram_var.get().strip(),
+            "phone": self.phone_var.get().strip(),
+            "position": self.position_var.get().strip(),
+            "email": self.email_var.get().strip(),
+            "comments": self.comments_text.get("1.0", tk.END).strip(),
+            "status": self.status_var.get().strip() or "первичный контакт",
+            "last_contact": self.last_contact_var.get().strip(),
+            "next_step": self.next_step_var.get().strip(),
+        }
+
+        if not data["company"] or not data["full_name"]:
+            messagebox.showwarning("Поля обязательны", "Укажите компанию и ФИО.")
+            return
+        try:
+            self.db.update_recruiter(data)
+            logging.info("Обновлен рекрутер id=%s", data["id"])
+            messagebox.showinfo("Готово", "Изменения сохранены.")
+            self.clear_form()
+            self._refresh_company_filter()
+            self._refresh_table()
+        except Exception as exc:
+            logging.exception("Ошибка при обновлении рекрутера: %s", exc)
+            messagebox.showerror("Ошибка", f"Не удалось сохранить: {exc}")
+
     def clear_form(self) -> None:
         self.company_var.set("")
         self.full_name_var.set("")
@@ -442,8 +551,11 @@ class CRMApp:
         self.phone_var.set("")
         self.position_var.set("")
         self.email_var.set("")
-        self.resume_var.set("")
+        self.status_var.set("первичный контакт")
+        self.last_contact_var.set("")
+        self.next_step_var.set("")
         self.comments_text.delete("1.0", tk.END)
+        self.current_edit_id = None
 
     def _refresh_company_filter(self) -> None:
         companies = self.db.get_companies()
@@ -456,11 +568,11 @@ class CRMApp:
         for row_id in self.tree.get_children():
             self.tree.delete(row_id)
         company_filter = self.filter_var.get()
-        rows = self.db.fetch_recruiters(company_filter)
+        status_filter = self.filter_status_var.get()
+        rows = self.db.fetch_recruiters(company_filter, status_filter)
         for row in rows:
             comments_short = (row["comments"][:120] + "...") if row["comments"] and len(row["comments"]) > 120 else (row["comments"] or "")
-            resume_short = Path(row["resume_path"]).name if row["resume_path"] else ""
-            self.tree.insert(
+            item_id = self.tree.insert(
                 "",
                 "end",
                 values=(
@@ -471,10 +583,14 @@ class CRMApp:
                     row["phone"],
                     row["position"],
                     row["email"],
-                    resume_short,
+                    row["status"] or "",
+                    row["last_contact"] or "",
+                    row["next_step"] or "",
                     comments_short,
                 ),
             )
+            # подсвечиваем email (тег не обязателен, но пригодится)
+            self.tree.item(item_id, tags=("email",))
         logging.info("Обновлен список рекрутеров (%s записей)", len(rows))
 
     def _get_selected_row(self) -> dict | None:
@@ -494,10 +610,40 @@ class CRMApp:
             "phone",
             "position",
             "email",
-            "resume_path",
+            "status",
+            "last_contact",
+            "next_step",
             "comments",
         ]
         return dict(zip(keys, values))
+
+    def _fill_form_from_row(self, row: dict) -> None:
+        self.current_edit_id = int(row["id"])
+        self.company_var.set(row.get("company", ""))
+        self.full_name_var.set(row.get("full_name", ""))
+        self.telegram_var.set(row.get("telegram", ""))
+        self.phone_var.set(row.get("phone", ""))
+        self.position_var.set(row.get("position", ""))
+        self.email_var.set(row.get("email", ""))
+        self.status_var.set(row.get("status", "") or "первичный контакт")
+        self.last_contact_var.set(row.get("last_contact", "") or "")
+        self.next_step_var.set(row.get("next_step", "") or "")
+        self.comments_text.delete("1.0", tk.END)
+        self.comments_text.insert("1.0", row.get("comments", "") or "")
+
+    def _fill_form_from_row(self, row: dict) -> None:
+        self.current_edit_id = int(row["id"])
+        self.company_var.set(row.get("company", ""))
+        self.full_name_var.set(row.get("full_name", ""))
+        self.telegram_var.set(row.get("telegram", ""))
+        self.phone_var.set(row.get("phone", ""))
+        self.position_var.set(row.get("position", ""))
+        self.email_var.set(row.get("email", ""))
+        self.status_var.set(row.get("status", "") or "первичный контакт")
+        self.last_contact_var.set(row.get("last_contact", "") or "")
+        self.next_step_var.set(row.get("next_step", "") or "")
+        self.comments_text.delete("1.0", tk.END)
+        self.comments_text.insert("1.0", row.get("comments", "") or "")
 
     def on_tree_double_click(self, event) -> None:
         region = self.tree.identify("region", event.x, event.y)
@@ -508,8 +654,72 @@ class CRMApp:
         col_name = self.tree["columns"][col_index]
         if col_name == "telegram":
             self.open_tg()
-        elif col_name == "resume_path":
-            self.open_resume()
+        elif col_name == "email":
+            self.open_email()
+        else:
+            row = self._get_selected_row()
+            if row:
+                self._fill_form_from_row(row)
+
+    def _pick_date(self, target_var: tk.StringVar) -> None:
+        """Простая модалка-календарь без внешних зависимостей."""
+        top = tk.Toplevel(self.root)
+        top.title("Выбор даты")
+        top.grab_set()
+        top.resizable(False, False)
+
+        today = datetime.date.today()
+        current = {"year": today.year, "month": today.month}
+
+        header = ttk.Frame(top, padding=6)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+
+        month_label = ttk.Label(header, text="")
+        month_label.grid(row=0, column=1)
+
+        def render():
+            month_label.config(text=f"{calendar.month_name[current['month']]} {current['year']}")
+            for w in body.winfo_children():
+                w.destroy()
+            week_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            for idx, name in enumerate(week_names):
+                ttk.Label(body, text=name, width=4, anchor="center").grid(row=0, column=idx, padx=1, pady=1)
+            weeks = calendar.monthcalendar(current["year"], current["month"])
+            for r, week in enumerate(weeks, start=1):
+                for c, day in enumerate(week):
+                    if day == 0:
+                        ttk.Label(body, text=" ", width=4).grid(row=r, column=c, padx=1, pady=1)
+                    else:
+                        def select(d=day):
+                            date_str = f"{current['year']:04d}-{current['month']:02d}-{d:02d}"
+                            target_var.set(date_str)
+                            top.destroy()
+                        ttk.Button(body, text=str(day), width=4, command=select).grid(row=r, column=c, padx=1, pady=1)
+
+        def prev_month():
+            if current["month"] == 1:
+                current["month"] = 12
+                current["year"] -= 1
+            else:
+                current["month"] -= 1
+            render()
+
+        def next_month():
+            if current["month"] == 12:
+                current["month"] = 1
+                current["year"] += 1
+            else:
+                current["month"] += 1
+            render()
+
+        ttk.Button(header, text="<", width=3, command=prev_month).grid(row=0, column=0, padx=2)
+        ttk.Button(header, text=">", width=3, command=next_month).grid(row=0, column=2, padx=2)
+
+        body = ttk.Frame(top, padding=6)
+        body.grid(row=1, column=0, sticky="nsew")
+
+        render()
 
     def open_tg(self) -> None:
         row = self._get_selected_row()
@@ -524,43 +734,68 @@ class CRMApp:
         try:
             opened = webbrowser.open(tg_url) or webbrowser.open(web_url)
             logging.info("Открыт Telegram для %s", handle)
-            # Открываем резюме, чтобы его сразу можно было прикрепить вручную
-            self._open_resume_path(row.get("resume_path"), notify=False)
             if not opened:
                 messagebox.showinfo("Telegram", f"Перейдите по ссылке: {web_url}")
         except Exception as exc:
             logging.exception("Не удалось открыть Telegram: %s", exc)
             messagebox.showerror("Ошибка", f"Не удалось открыть Telegram: {exc}")
 
-    def _open_resume_path(self, path_value: str | None, notify: bool = True) -> None:
-        if not path_value:
-            if notify:
-                messagebox.showwarning("Резюме", "Резюме не привязано.")
-            return
-        path = Path(path_value)
-        if not path.exists():
-            if notify:
-                messagebox.showerror("Резюме", "Файл резюме не найден.")
-            logging.warning("Файл резюме не найден: %s", path)
-            return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(path)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.call(["open", path])
-            else:
-                subprocess.call(["xdg-open", path])
-            logging.info("Открыто резюме: %s", path)
-        except Exception as exc:
-            logging.exception("Ошибка при открытии резюме: %s", exc)
-            if notify:
-                messagebox.showerror("Резюме", f"Не удалось открыть файл: {exc}")
-
-    def open_resume(self) -> None:
+    def open_email(self) -> None:
         row = self._get_selected_row()
         if not row:
             return
-        self._open_resume_path(row.get("resume_path"), notify=True)
+        email = (row.get("email") or "").strip()
+        if not email:
+            messagebox.showwarning("Почта", "У этого рекрутера не указана почта.")
+            return
+        subject = "Вопрос по вакансии"
+        try:
+            # Быстрый путь: всегда Gmail compose, чтобы не зависеть от mailto и браузерных handler'ов
+            if USE_GMAIL_COMPOSE:
+                gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={email}&su={subject.replace(' ', '%20')}"
+                webbrowser.open(gmail_url)
+                logging.info("Gmail compose для %s", email)
+            else:
+                mailto = f"mailto:{email}?subject={subject}"
+                opened = False
+                if sys.platform.startswith("win"):
+                    try:
+                        os.startfile(mailto)  # type: ignore[attr-defined]
+                        opened = True
+                    except Exception:
+                        pass
+                    if not opened:
+                        try:
+                            subprocess.Popen(["cmd", "/c", "start", "", mailto], shell=True)
+                            opened = True
+                        except Exception:
+                            pass
+                if not opened:
+                    opened = webbrowser.open(mailto)
+                logging.info("Открыт mailto для %s (opened=%s)", email, opened)
+                if not opened:
+                    gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={email}&su={subject.replace(' ', '%20')}"
+                    webbrowser.open(gmail_url)
+                    logging.info("Fallback Gmail compose для %s", email)
+                    messagebox.showinfo(
+                        "Почта",
+                        "Не получилось открыть системный почтовый клиент.\nОткрыл Gmail compose в браузере.\n"
+                        "Проверьте, что по умолчанию назначен почтовый клиент для mailto.",
+                    )
+        except Exception as exc:
+            logging.exception("Не удалось открыть почту: %s", exc)
+            messagebox.showerror(
+                "Почта",
+                f"Не удалось открыть почту.\nОшибка: {exc}\n"
+                f"Адрес: {email}",
+            )
+        finally:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(email)
+            except Exception:
+                pass
+
 
     def delete_recruiter(self) -> None:
         row = self._get_selected_row()
