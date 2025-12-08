@@ -138,6 +138,10 @@ class RecruiterDB:
         self.conn.execute("DELETE FROM recruiters WHERE id = ?", (recruiter_id,))
         self.conn.commit()
 
+    def get_recruiter(self, recruiter_id: int) -> sqlite3.Row | None:
+        cursor = self.conn.execute("SELECT * FROM recruiters WHERE id = ?", (recruiter_id,))
+        return cursor.fetchone()
+
     def get_companies(self) -> list[str]:
         cursor = self.conn.execute("SELECT DISTINCT company FROM recruiters ORDER BY company")
         return [row["company"] for row in cursor.fetchall()]
@@ -515,6 +519,27 @@ class CRMApp:
         values = item["values"]
         if not values:
             return None
+        # Берем id и вытягиваем полные данные из БД, чтобы не использовать усечённый комментарий из таблицы
+        try:
+            recruiter_id = int(values[0])
+        except (TypeError, ValueError):
+            recruiter_id = None
+        row_full = self.db.get_recruiter(recruiter_id) if recruiter_id else None
+        if row_full:
+            return {
+                "id": row_full["id"],
+                "company": row_full["company"],
+                "full_name": row_full["full_name"],
+                "telegram": row_full["telegram"],
+                "phone": row_full["phone"],
+                "position": row_full["position"],
+                "email": row_full["email"],
+                "status": row_full["status"],
+                "last_contact": row_full["last_contact"],
+                "next_step": row_full["next_step"],
+                "comments": row_full["comments"],
+            }
+        # Фолбек: если по какой-то причине не нашли в БД — используем данные из таблицы (могут быть усечены)
         keys = [
             "id",
             "company",
