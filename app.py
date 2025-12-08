@@ -23,6 +23,7 @@ USE_GMAIL_COMPOSE = True  # если True, открываем сразу Gmail c
 
 DEFAULT_STATUS = "первичный контакт"
 STATUS_OPTIONS: tuple[str, ...] = (
+    "не контактировал",
     "первичный контакт",
     "ожидание ответа",
     "интервью",
