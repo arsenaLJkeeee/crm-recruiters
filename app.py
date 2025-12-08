@@ -30,6 +30,7 @@ STATUS_OPTIONS: tuple[str, ...] = (
     "отказ",
 )
 COMMENT_PREVIEW_LIMIT = 120
+DATE_COLUMNS = {"last_contact", "next_step"}
 
 
 def setup_logging() -> None:
@@ -85,19 +86,22 @@ class Recruiter:
 
     def normalized(self) -> "Recruiter":
         """Возвращает копию с приведёнными значениями и дефолтным статусом."""
+        def _clean(value: str | None) -> str:
+            return (value or "").strip()
+
         return Recruiter(
             id=self.id,
-            company=self.company.strip(),
-            full_name=self.full_name.strip(),
-            telegram=self.telegram.strip(),
-            phone=self.phone.strip(),
-            position=self.position.strip(),
-            email=self.email.strip(),
-            comments=self.comments.strip(),
-            resume_path=self.resume_path.strip(),
-            status=self.status.strip() if self.status else DEFAULT_STATUS,
-            last_contact=self.last_contact.strip(),
-            next_step=self.next_step.strip(),
+            company=_clean(self.company),
+            full_name=_clean(self.full_name),
+            telegram=_clean(self.telegram),
+            phone=_clean(self.phone),
+            position=_clean(self.position),
+            email=_clean(self.email),
+            comments=_clean(self.comments),
+            resume_path=_clean(self.resume_path),
+            status=_clean(self.status) or DEFAULT_STATUS,
+            last_contact=_clean(self.last_contact),
+            next_step=_clean(self.next_step),
         )
 
     def insert_params(self) -> dict:
@@ -325,6 +329,19 @@ class CRMApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _init_vars(self) -> None:
+        self.columns = (
+            "id",
+            "company",
+            "full_name",
+            "telegram",
+            "phone",
+            "position",
+            "email",
+            "status",
+            "last_contact",
+            "next_step",
+            "comments",
+        )
         self.company_var = tk.StringVar()
         self.full_name_var = tk.StringVar()
         self.telegram_var = tk.StringVar()
@@ -338,6 +355,8 @@ class CRMApp:
         self.filter_status_var = tk.StringVar(value="Все")
         self.current_edit_id: int | None = None
         self.current_resume_path: str = ""
+        self.sort_column: str | None = None
+        self.sort_reverse: bool = False
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -446,21 +465,8 @@ class CRMApp:
         table_frame = ttk.Frame(self.root, padding=(12, 0))
         table_frame.grid(row=2, column=0, sticky="nsew")
 
-        columns = (
-            "id",
-            "company",
-            "full_name",
-            "telegram",
-            "phone",
-            "position",
-            "email",
-            "status",
-            "last_contact",
-            "next_step",
-            "comments",
-        )
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", height=12)
-        headings = {
+        self.tree = ttk.Treeview(table_frame, columns=self.columns, show="headings", selectmode="browse", height=12)
+        self.headings = {
             "company": "Компания",
             "full_name": "ФИО",
             "telegram": "TG",
@@ -472,7 +478,7 @@ class CRMApp:
             "next_step": "След. шаг",
             "comments": "Комментарий",
         }
-        for col in columns:
+        for col in self.columns:
             if col == "id":
                 self.tree.column(col, width=0, stretch=False, anchor="center")
             elif col == "comments":
@@ -483,9 +489,8 @@ class CRMApp:
                 self.tree.column(col, width=180, anchor="w")
             else:
                 self.tree.column(col, width=120, anchor="w")
-            self.tree.heading(col, text=headings.get(col, col))
+            self.tree.heading(col, text=self.headings.get(col, col), command=lambda c=col: self._on_heading_click(c))
 
-        self.tree.tag_configure("email", foreground="#0a5dbd")
         self.tree.bind("<Double-1>", self.on_tree_double_click)
 
         tree_scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
@@ -576,9 +581,10 @@ class CRMApp:
             self.repo.update(recruiter)
             logging.info("Обновлен рекрутер id=%s", recruiter.id)
             messagebox.showinfo("Готово", "Изменения сохранены.")
+            saved_id = recruiter.id
             self.clear_form()
             self._refresh_company_filter()
-            self._refresh_table()
+            self._refresh_table(focus_id=saved_id)
         except Exception as exc:
             logging.exception("Ошибка при обновлении рекрутера: %s", exc)
             messagebox.showerror("Ошибка", f"Не удалось сохранить: {exc}")
@@ -630,16 +636,63 @@ class CRMApp:
         if self.filter_var.get() not in values:
             self.filter_var.set("Все")
 
-    def _refresh_table(self) -> None:
+    def _refresh_table(self, focus_id: int | None = None) -> None:
         for row_id in self.tree.get_children():
             self.tree.delete(row_id)
         rows = self.repo.fetch(self.filter_var.get(), self.filter_status_var.get())
+        rows = self._sorted_rows(rows)
         for recruiter in rows:
-            self._insert_tree_row(recruiter)
+            item_id = self._insert_tree_row(recruiter)
+            if focus_id is not None and recruiter.id == focus_id:
+                self.tree.selection_set(item_id)
+                self.tree.focus(item_id)
         logging.info("Обновлен список рекрутеров (%s записей)", len(rows))
+        self._update_heading_indicators()
 
-    def _insert_tree_row(self, recruiter: Recruiter) -> None:
-        item_id = self.tree.insert(
+    def _sorted_rows(self, rows: list[Recruiter]) -> list[Recruiter]:
+        if not self.sort_column:
+            return rows
+        col = self.sort_column
+        reverse = self.sort_reverse
+
+        def key(rec: Recruiter):
+            val = getattr(rec, col)
+            if col in DATE_COLUMNS:
+                try:
+                    dt = datetime.date.fromisoformat(val)
+                except Exception:
+                    dt = None
+                if dt is None:
+                    dt = datetime.date.min if reverse else datetime.date.max
+                return dt
+            if col == "id":
+                try:
+                    return int(val) if val is not None else -1
+                except Exception:
+                    return -1
+            return (val or "").lower()
+
+        return sorted(rows, key=key, reverse=reverse)
+
+    def _on_heading_click(self, column: str) -> None:
+        if self.sort_column == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = column
+            self.sort_reverse = column in DATE_COLUMNS  # даты сразу показываем поздние сверху
+        self._refresh_table()
+
+    def _update_heading_indicators(self) -> None:
+        for col in self.columns:
+            base = self.headings.get(col, col)
+            if col == self.sort_column:
+                arrow = "↓" if self.sort_reverse else "↑"
+                self.tree.heading(col, text=f"{base} {arrow}")
+            else:
+                self.tree.heading(col, text=base)
+
+    def _insert_tree_row(self, recruiter: Recruiter) -> str:
+        return self.tree.insert(
             "",
             "end",
             values=(
@@ -656,8 +709,6 @@ class CRMApp:
                 recruiter.comment_preview(),
             ),
         )
-        self.tree.item(item_id, tags=("email",))
-
     def _get_selected_recruiter(self) -> Recruiter | None:
         selection = self.tree.selection()
         if not selection:
