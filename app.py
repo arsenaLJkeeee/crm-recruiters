@@ -1,17 +1,16 @@
+import calendar
+import datetime
 import logging
-from logging.handlers import TimedRotatingFileHandler
 import os
 import sqlite3
+import subprocess
 import sys
 import tkinter as tk
-from pathlib import Path
-from tkinter import messagebox
-from tkinter import ttk
 import webbrowser
-import subprocess
-import datetime
-import calendar
-
+from dataclasses import asdict, dataclass
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+from tkinter import messagebox, ttk
 
 APP_TITLE = "CRM рекрутеров"
 BASE_DIR = Path(__file__).resolve().parent
@@ -22,8 +21,19 @@ APP_VERSION = "0.0.1"
 KEY_LOGGING = True  # временно для отладки хоткеев
 USE_GMAIL_COMPOSE = True  # если True, открываем сразу Gmail compose вместо mailto (обходит браузерные handlers)
 
+DEFAULT_STATUS = "первичный контакт"
+STATUS_OPTIONS: tuple[str, ...] = (
+    "первичный контакт",
+    "ожидание ответа",
+    "интервью",
+    "оффер",
+    "отказ",
+)
+COMMENT_PREVIEW_LIMIT = 120
+
 
 def setup_logging() -> None:
+    """Инициализация логирования в файл и консоль."""
     LOG_DIR.mkdir(exist_ok=True)
     handler = TimedRotatingFileHandler(
         LOG_FILE, when="midnight", backupCount=14, encoding="utf-8"
@@ -36,13 +46,75 @@ def setup_logging() -> None:
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
-    # Console output helps debug if app is run from terminal
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     root_logger.addHandler(console)
 
 
-class RecruiterDB:
+@dataclass
+class Recruiter:
+    id: int | None = None
+    company: str = ""
+    full_name: str = ""
+    telegram: str = ""
+    phone: str = ""
+    position: str = ""
+    email: str = ""
+    comments: str = ""
+    resume_path: str = ""
+    status: str = DEFAULT_STATUS
+    last_contact: str = ""
+    next_step: str = ""
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Recruiter":
+        return cls(
+            id=row["id"],
+            company=row["company"],
+            full_name=row["full_name"],
+            telegram=row["telegram"],
+            phone=row["phone"],
+            position=row["position"],
+            email=row["email"],
+            comments=row["comments"],
+            resume_path=row["resume_path"] if "resume_path" in row.keys() else "",
+            status=row["status"],
+            last_contact=row["last_contact"],
+            next_step=row["next_step"],
+        )
+
+    def normalized(self) -> "Recruiter":
+        """Возвращает копию с приведёнными значениями и дефолтным статусом."""
+        return Recruiter(
+            id=self.id,
+            company=self.company.strip(),
+            full_name=self.full_name.strip(),
+            telegram=self.telegram.strip(),
+            phone=self.phone.strip(),
+            position=self.position.strip(),
+            email=self.email.strip(),
+            comments=self.comments.strip(),
+            resume_path=self.resume_path.strip(),
+            status=self.status.strip() if self.status else DEFAULT_STATUS,
+            last_contact=self.last_contact.strip(),
+            next_step=self.next_step.strip(),
+        )
+
+    def insert_params(self) -> dict:
+        data = asdict(self.normalized())
+        data.pop("id", None)
+        return data
+
+    def update_params(self) -> dict:
+        return asdict(self.normalized())
+
+    def comment_preview(self, limit: int = COMMENT_PREVIEW_LIMIT) -> str:
+        if not self.comments:
+            return ""
+        return f"{self.comments[:limit]}..." if len(self.comments) > limit else self.comments
+
+
+class RecruiterRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path)
@@ -81,12 +153,25 @@ class RecruiterDB:
             alter_queries.append("ALTER TABLE recruiters ADD COLUMN last_contact TEXT")
         if "next_step" not in cols:
             alter_queries.append("ALTER TABLE recruiters ADD COLUMN next_step TEXT")
-        for q in alter_queries:
-            self.conn.execute(q)
+        if "resume_path" not in cols:
+            alter_queries.append("ALTER TABLE recruiters ADD COLUMN resume_path TEXT")
+        for query in alter_queries:
+            self.conn.execute(query)
         if alter_queries:
             self.conn.commit()
 
-    def update_recruiter(self, data: dict) -> None:
+    def add(self, recruiter: Recruiter) -> None:
+        query = """
+        INSERT INTO recruiters
+        (company, full_name, telegram, phone, position, email, comments, resume_path, status, last_contact, next_step)
+        VALUES (:company, :full_name, :telegram, :phone, :position, :email, :comments, :resume_path, :status, :last_contact, :next_step)
+        """
+        self.conn.execute(query, recruiter.insert_params())
+        self.conn.commit()
+
+    def update(self, recruiter: Recruiter) -> None:
+        if recruiter.id is None:
+            raise ValueError("Не указан id для обновления рекрутера")
         query = """
         UPDATE recruiters
         SET company = :company,
@@ -96,24 +181,16 @@ class RecruiterDB:
             position = :position,
             email = :email,
             comments = :comments,
+            resume_path = :resume_path,
             status = :status,
             last_contact = :last_contact,
             next_step = :next_step
         WHERE id = :id
         """
-        self.conn.execute(query, data)
+        self.conn.execute(query, recruiter.update_params())
         self.conn.commit()
 
-    def add_recruiter(self, data: dict) -> None:
-        query = """
-        INSERT INTO recruiters
-        (company, full_name, telegram, phone, position, email, comments, status, last_contact, next_step)
-        VALUES (:company, :full_name, :telegram, :phone, :position, :email, :comments, :status, :last_contact, :next_step)
-        """
-        self.conn.execute(query, data)
-        self.conn.commit()
-
-    def fetch_recruiters(self, company_filter: str | None = None, status_filter: str | None = None) -> list[sqlite3.Row]:
+    def fetch(self, company_filter: str | None = None, status_filter: str | None = None) -> list[Recruiter]:
         where = []
         params: list = []
         if company_filter and company_filter != "Все":
@@ -122,7 +199,7 @@ class RecruiterDB:
         if status_filter and status_filter != "Все":
             where.append("status = ?")
             params.append(status_filter)
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         query = f"""
         SELECT * FROM recruiters
         {where_sql}
@@ -132,19 +209,100 @@ class RecruiterDB:
             created_at DESC
         """
         cursor = self.conn.execute(query, params)
-        return cursor.fetchall()
+        return [Recruiter.from_row(row) for row in cursor.fetchall()]
 
-    def delete_recruiter(self, recruiter_id: int) -> None:
+    def delete(self, recruiter_id: int) -> None:
         self.conn.execute("DELETE FROM recruiters WHERE id = ?", (recruiter_id,))
         self.conn.commit()
 
-    def get_recruiter(self, recruiter_id: int) -> sqlite3.Row | None:
+    def get(self, recruiter_id: int) -> Recruiter | None:
         cursor = self.conn.execute("SELECT * FROM recruiters WHERE id = ?", (recruiter_id,))
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        return Recruiter.from_row(row) if row else None
 
     def get_companies(self) -> list[str]:
         cursor = self.conn.execute("SELECT DISTINCT company FROM recruiters ORDER BY company")
         return [row["company"] for row in cursor.fetchall()]
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
+class DatePicker:
+    def __init__(self, parent: tk.Tk, target_var: tk.StringVar) -> None:
+        self.parent = parent
+        self.target_var = target_var
+        self.top = tk.Toplevel(self.parent)
+        self.top.title("Выбор даты")
+        self.top.grab_set()
+        self.top.resizable(False, False)
+        today = datetime.date.today()
+        self.current = {"year": today.year, "month": today.month}
+        self._build()
+
+    @classmethod
+    def open(cls, parent: tk.Tk, target_var: tk.StringVar) -> None:
+        cls(parent, target_var)
+
+    def _build(self) -> None:
+        header = ttk.Frame(self.top, padding=6)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+
+        self.month_label = ttk.Label(header, text="")
+        self.month_label.grid(row=0, column=1)
+
+        ttk.Button(header, text="<", width=3, command=self._prev_month).grid(row=0, column=0, padx=2)
+        ttk.Button(header, text=">", width=3, command=self._next_month).grid(row=0, column=2, padx=2)
+
+        self.body = ttk.Frame(self.top, padding=6)
+        self.body.grid(row=1, column=0, sticky="nsew")
+
+        self._render_calendar()
+
+    def _render_calendar(self) -> None:
+        self.month_label.config(text=f"{calendar.month_name[self.current['month']]} {self.current['year']}")
+        for widget in self.body.winfo_children():
+            widget.destroy()
+        week_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        for idx, name in enumerate(week_names):
+            ttk.Label(self.body, text=name, width=4, anchor="center").grid(row=0, column=idx, padx=1, pady=1)
+        weeks = calendar.monthcalendar(self.current["year"], self.current["month"])
+        for r, week in enumerate(weeks, start=1):
+            for c, day in enumerate(week):
+                if day == 0:
+                    ttk.Label(self.body, text=" ", width=4).grid(row=r, column=c, padx=1, pady=1)
+                else:
+                    ttk.Button(
+                        self.body,
+                        text=str(day),
+                        width=4,
+                        command=lambda d=day: self._select_date(d),
+                    ).grid(row=r, column=c, padx=1, pady=1)
+
+    def _prev_month(self) -> None:
+        if self.current["month"] == 1:
+            self.current["month"] = 12
+            self.current["year"] -= 1
+        else:
+            self.current["month"] -= 1
+        self._render_calendar()
+
+    def _next_month(self) -> None:
+        if self.current["month"] == 12:
+            self.current["month"] = 1
+            self.current["year"] += 1
+        else:
+            self.current["month"] += 1
+        self._render_calendar()
+
+    def _select_date(self, day: int) -> None:
+        date_str = f"{self.current['year']:04d}-{self.current['month']:02d}-{day:02d}"
+        self.target_var.set(date_str)
+        self.top.destroy()
 
 
 class CRMApp:
@@ -153,36 +311,48 @@ class CRMApp:
         self.root.title(APP_TITLE)
         self.root.geometry("1100x750")
         self.root.minsize(960, 650)
-        # Шрифт с пробелом в названии нужно экранировать для Tk
-        self.root.option_add("*Font", "{Segoe UI} 10")
+        self.root.option_add("*Font", "{Segoe UI} 10")  # экранирование пробела в названии шрифта
 
-        self.db = RecruiterDB(DB_PATH)
+        self.repo = RecruiterRepository(DB_PATH)
 
-        self.company_var = tk.StringVar()
-        self.full_name_var = tk.StringVar()
-        self.telegram_var = tk.StringVar()
-        self.phone_var = tk.StringVar()
-        self.position_var = tk.StringVar()
-        self.email_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="первичный контакт")
-        self.last_contact_var = tk.StringVar()
-        self.next_step_var = tk.StringVar()
-        self.filter_var = tk.StringVar(value="Все")
-        self.filter_status_var = tk.StringVar(value="Все")
-        self.current_edit_id: int | None = None
-
+        self._init_vars()
         self._build_ui()
         self._bind_shortcuts()
         if KEY_LOGGING:
             self._bind_debug_key_logging()
         self._refresh_company_filter()
         self._refresh_table()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _init_vars(self) -> None:
+        self.company_var = tk.StringVar()
+        self.full_name_var = tk.StringVar()
+        self.telegram_var = tk.StringVar()
+        self.phone_var = tk.StringVar()
+        self.position_var = tk.StringVar()
+        self.email_var = tk.StringVar()
+        self.status_var = tk.StringVar(value=DEFAULT_STATUS)
+        self.last_contact_var = tk.StringVar()
+        self.next_step_var = tk.StringVar()
+        self.filter_var = tk.StringVar(value="Все")
+        self.filter_status_var = tk.StringVar(value="Все")
+        self.current_edit_id: int | None = None
+        self.current_resume_path: str = ""
 
     def _build_ui(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Treeview", rowheight=28)
 
+        self._build_form()
+        self._build_filters()
+        self._build_table()
+        self._build_actions()
+
+        self.root.grid_rowconfigure(2, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+
+    def _build_form(self) -> None:
         form_frame = ttk.LabelFrame(self.root, text="Новый рекрутер", padding=12)
         form_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
 
@@ -197,39 +367,34 @@ class CRMApp:
 
         for idx, (label, var) in enumerate(labels):
             ttk.Label(form_frame, text=label).grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 8))
-            entry = ttk.Entry(form_frame, textvariable=var, width=40)
-            entry.grid(row=idx, column=1, sticky="ew", pady=3)
+            ttk.Entry(form_frame, textvariable=var, width=40).grid(row=idx, column=1, sticky="ew", pady=3)
 
-        # Status and dates
         ttk.Label(form_frame, text="Статус").grid(row=0, column=2, sticky="w", pady=3, padx=(16, 8))
         self.status_combo = ttk.Combobox(
             form_frame,
             textvariable=self.status_var,
             state="readonly",
-            values=[
-                "первичный контакт",
-                "ожидание ответа",
-                "интервью",
-                "оффер",
-                "отказ",
-            ],
+            values=list(STATUS_OPTIONS),
             width=28,
         )
         self.status_combo.grid(row=0, column=3, sticky="w", pady=3)
 
-        ttk.Label(form_frame, text="Последний контакт (YYYY-MM-DD)").grid(row=1, column=2, sticky="w", pady=3, padx=(16, 8))
+        ttk.Label(form_frame, text="Последний контакт (YYYY-MM-DD)").grid(
+            row=1, column=2, sticky="w", pady=3, padx=(16, 8)
+        )
         ttk.Entry(form_frame, textvariable=self.last_contact_var, width=22).grid(row=1, column=3, sticky="w", pady=3)
-        ttk.Button(form_frame, text="Выбрать", command=lambda: self._pick_date(self.last_contact_var)).grid(
+        ttk.Button(form_frame, text="Выбрать", command=lambda: DatePicker.open(self.root, self.last_contact_var)).grid(
             row=1, column=4, sticky="w", padx=(4, 0)
         )
 
-        ttk.Label(form_frame, text="Следующий шаг (YYYY-MM-DD)").grid(row=2, column=2, sticky="w", pady=3, padx=(16, 8))
+        ttk.Label(form_frame, text="Следующий шаг (YYYY-MM-DD)").grid(
+            row=2, column=2, sticky="w", pady=3, padx=(16, 8)
+        )
         ttk.Entry(form_frame, textvariable=self.next_step_var, width=22).grid(row=2, column=3, sticky="w", pady=3)
-        ttk.Button(form_frame, text="Выбрать", command=lambda: self._pick_date(self.next_step_var)).grid(
+        ttk.Button(form_frame, text="Выбрать", command=lambda: DatePicker.open(self.root, self.next_step_var)).grid(
             row=2, column=4, sticky="w", padx=(4, 0)
         )
 
-        # Comments
         ttk.Label(form_frame, text="Комментарии / заметки").grid(
             row=3, column=2, sticky="nw", pady=3, padx=(16, 8)
         )
@@ -243,7 +408,6 @@ class CRMApp:
         comments_frame.columnconfigure(0, weight=1)
         comments_frame.rowconfigure(0, weight=1)
 
-        # Buttons
         btn_frame = ttk.Frame(form_frame)
         btn_frame.grid(row=len(labels) + 4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
         ttk.Button(btn_frame, text="Добавить рекрутера", command=self.add_recruiter).grid(
@@ -256,13 +420,11 @@ class CRMApp:
             row=0, column=2, padx=(0, 8)
         )
 
-        # Filter bar
+    def _build_filters(self) -> None:
         filter_frame = ttk.LabelFrame(self.root, text="Просмотр", padding=12)
         filter_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
         ttk.Label(filter_frame, text="Компания").grid(row=0, column=0, padx=(0, 8))
-        self.filter_combo = ttk.Combobox(
-            filter_frame, textvariable=self.filter_var, state="readonly", width=30
-        )
+        self.filter_combo = ttk.Combobox(filter_frame, textvariable=self.filter_var, state="readonly", width=30)
         self.filter_combo.grid(row=0, column=1, padx=(0, 12))
         ttk.Label(filter_frame, text="Статус").grid(row=0, column=2, padx=(0, 8))
         self.filter_status_combo = ttk.Combobox(
@@ -270,7 +432,7 @@ class CRMApp:
             textvariable=self.filter_status_var,
             state="readonly",
             width=22,
-            values=["Все", "первичный контакт", "ожидание ответа", "интервью", "оффер", "отказ"],
+            values=["Все", *STATUS_OPTIONS],
         )
         self.filter_status_combo.grid(row=0, column=3, padx=(0, 12))
         ttk.Button(filter_frame, text="Показать рекрутеров", command=self._refresh_table).grid(
@@ -280,7 +442,7 @@ class CRMApp:
             row=0, column=5
         )
 
-        # Table
+    def _build_table(self) -> None:
         table_frame = ttk.Frame(self.root, padding=(12, 0))
         table_frame.grid(row=2, column=0, sticky="nsew")
 
@@ -297,9 +459,7 @@ class CRMApp:
             "next_step",
             "comments",
         )
-        self.tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", selectmode="browse", height=12
-        )
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", height=12)
         headings = {
             "company": "Компания",
             "full_name": "ФИО",
@@ -325,19 +485,17 @@ class CRMApp:
                 self.tree.column(col, width=120, anchor="w")
             self.tree.heading(col, text=headings.get(col, col))
 
-        self.tree.bind("<Double-1>", self.on_tree_double_click)
-        # Отдельный биндинг на клик по email — открывать почту
         self.tree.tag_configure("email", foreground="#0a5dbd")
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
 
         tree_scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll_y.set)
-
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll_y.grid(row=0, column=1, sticky="ns")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
-        # Action buttons under table
+    def _build_actions(self) -> None:
         actions = ttk.Frame(self.root, padding=12)
         actions.grid(row=3, column=0, sticky="ew")
         ttk.Button(actions, text="Открыть TG", command=self.open_tg).grid(row=0, column=0, padx=(0, 8))
@@ -346,23 +504,17 @@ class CRMApp:
             row=0, column=2, padx=(0, 8)
         )
 
-        self.root.grid_rowconfigure(2, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
-
     def _bind_shortcuts(self) -> None:
-        """Хоткеи: используем стандартные бинды, плюс фолбек по keycode для нераспознанных раскладок."""
-
-        # Фолбек только когда keysym не распознан (например, "??" при русской раскладке).
+        """Хоткеи: стандартные бинды + фолбек по keycode для нераспознанных раскладок."""
         keycode_map = {
-            67: "<<Copy>>",   # C
+            67: "<<Copy>>",  # C
             86: "<<Paste>>",  # V
-            88: "<<Cut>>",    # X
+            88: "<<Cut>>",  # X
             65: "<<SelectAll>>",  # A
-            90: "<<Undo>>",   # Z
+            90: "<<Undo>>",  # Z
         }
 
         def on_ctrl_keycode(event: tk.Event) -> str | None:
-            # Если keysym нормальный (c, v, x, a, z) — пусть работает дефолтный биндинг Tk.
             if event.keysym and event.keysym.lower() in ("c", "v", "x", "a", "z"):
                 return None
             action = keycode_map.get(event.keycode)
@@ -377,7 +529,6 @@ class CRMApp:
         self.root.bind_all("<Control-KeyPress>", on_ctrl_keycode, add="+")
 
     def _bind_debug_key_logging(self) -> None:
-        """Логирование нажатий и виртуальных событий для диагностики."""
         def log_key(event: tk.Event) -> None:
             logging.info(
                 "KEY keycode=%s keysym=%s state=%s widget=%s",
@@ -393,34 +544,19 @@ class CRMApp:
         def log_virtual(name: str):
             def _inner(event: tk.Event) -> None:
                 logging.info("VIRTUAL %s widget=%s", name, getattr(event.widget, "winfo_class", lambda: "?")())
+
             return _inner
 
         for virtual in ("<<Copy>>", "<<Cut>>", "<<Paste>>", "<<SelectAll>>"):
             self.root.bind_all(virtual, log_virtual(virtual), add="+")
 
     def add_recruiter(self) -> None:
-        data = {
-            "company": self.company_var.get().strip(),
-            "full_name": self.full_name_var.get().strip(),
-            "telegram": self.telegram_var.get().strip(),
-            "phone": self.phone_var.get().strip(),
-            "position": self.position_var.get().strip(),
-            "email": self.email_var.get().strip(),
-            "comments": self.comments_text.get("1.0", tk.END).strip(),
-            "status": self.status_var.get().strip() or "первичный контакт",
-            "last_contact": self.last_contact_var.get().strip(),
-            "next_step": self.next_step_var.get().strip(),
-        }
-
-        if not data["company"]:
-            messagebox.showwarning("Поля обязательны", "Укажите компанию.")
-            return
-        if not data["full_name"]:
-            messagebox.showwarning("Поля обязательны", "Укажите ФИО.")
+        recruiter = self._get_recruiter_from_form()
+        if not self._validate_required(recruiter):
             return
         try:
-            self.db.add_recruiter(data)
-            logging.info("Добавлен рекрутер: %s (%s)", data["full_name"], data["company"])
+            self.repo.add(recruiter)
+            logging.info("Добавлен рекрутер: %s (%s)", recruiter.full_name, recruiter.company)
             messagebox.showinfo("Готово", "Рекрутер добавлен.")
             self.clear_form()
             self._refresh_company_filter()
@@ -433,26 +569,12 @@ class CRMApp:
         if not self.current_edit_id:
             messagebox.showinfo("Правка", "Сначала выберите запись (двойной клик), чтобы редактировать.")
             return
-        data = {
-            "id": self.current_edit_id,
-            "company": self.company_var.get().strip(),
-            "full_name": self.full_name_var.get().strip(),
-            "telegram": self.telegram_var.get().strip(),
-            "phone": self.phone_var.get().strip(),
-            "position": self.position_var.get().strip(),
-            "email": self.email_var.get().strip(),
-            "comments": self.comments_text.get("1.0", tk.END).strip(),
-            "status": self.status_var.get().strip() or "первичный контакт",
-            "last_contact": self.last_contact_var.get().strip(),
-            "next_step": self.next_step_var.get().strip(),
-        }
-
-        if not data["company"] or not data["full_name"]:
-            messagebox.showwarning("Поля обязательны", "Укажите компанию и ФИО.")
+        recruiter = self._get_recruiter_from_form(include_id=True)
+        if not self._validate_required(recruiter):
             return
         try:
-            self.db.update_recruiter(data)
-            logging.info("Обновлен рекрутер id=%s", data["id"])
+            self.repo.update(recruiter)
+            logging.info("Обновлен рекрутер id=%s", recruiter.id)
             messagebox.showinfo("Готово", "Изменения сохранены.")
             self.clear_form()
             self._refresh_company_filter()
@@ -461,6 +583,32 @@ class CRMApp:
             logging.exception("Ошибка при обновлении рекрутера: %s", exc)
             messagebox.showerror("Ошибка", f"Не удалось сохранить: {exc}")
 
+    def _get_recruiter_from_form(self, include_id: bool = False) -> Recruiter:
+        recruiter = Recruiter(
+            id=self.current_edit_id if include_id else None,
+            company=self.company_var.get(),
+            full_name=self.full_name_var.get(),
+            telegram=self.telegram_var.get(),
+            phone=self.phone_var.get(),
+            position=self.position_var.get(),
+            email=self.email_var.get(),
+            comments=self.comments_text.get("1.0", tk.END),
+            resume_path=self.current_resume_path,
+            status=self.status_var.get() or DEFAULT_STATUS,
+            last_contact=self.last_contact_var.get(),
+            next_step=self.next_step_var.get(),
+        )
+        return recruiter.normalized()
+
+    def _validate_required(self, recruiter: Recruiter) -> bool:
+        if not recruiter.company:
+            messagebox.showwarning("Поля обязательны", "Укажите компанию.")
+            return False
+        if not recruiter.full_name:
+            messagebox.showwarning("Поля обязательны", "Укажите ФИО.")
+            return False
+        return True
+
     def clear_form(self) -> None:
         self.company_var.set("")
         self.full_name_var.set("")
@@ -468,14 +616,15 @@ class CRMApp:
         self.phone_var.set("")
         self.position_var.set("")
         self.email_var.set("")
-        self.status_var.set("первичный контакт")
+        self.status_var.set(DEFAULT_STATUS)
         self.last_contact_var.set("")
         self.next_step_var.set("")
         self.comments_text.delete("1.0", tk.END)
         self.current_edit_id = None
+        self.current_resume_path = ""
 
     def _refresh_company_filter(self) -> None:
-        companies = self.db.get_companies()
+        companies = self.repo.get_companies()
         values = ["Все"] + companies
         self.filter_combo["values"] = values
         if self.filter_var.get() not in values:
@@ -484,33 +633,32 @@ class CRMApp:
     def _refresh_table(self) -> None:
         for row_id in self.tree.get_children():
             self.tree.delete(row_id)
-        company_filter = self.filter_var.get()
-        status_filter = self.filter_status_var.get()
-        rows = self.db.fetch_recruiters(company_filter, status_filter)
-        for row in rows:
-            comments_short = (row["comments"][:120] + "...") if row["comments"] and len(row["comments"]) > 120 else (row["comments"] or "")
-            item_id = self.tree.insert(
-                "",
-                "end",
-                values=(
-                    row["id"],
-                    row["company"],
-                    row["full_name"],
-                    row["telegram"],
-                    row["phone"],
-                    row["position"],
-                    row["email"],
-                    row["status"] or "",
-                    row["last_contact"] or "",
-                    row["next_step"] or "",
-                    comments_short,
-                ),
-            )
-            # подсвечиваем email (тег не обязателен, но пригодится)
-            self.tree.item(item_id, tags=("email",))
+        rows = self.repo.fetch(self.filter_var.get(), self.filter_status_var.get())
+        for recruiter in rows:
+            self._insert_tree_row(recruiter)
         logging.info("Обновлен список рекрутеров (%s записей)", len(rows))
 
-    def _get_selected_row(self) -> dict | None:
+    def _insert_tree_row(self, recruiter: Recruiter) -> None:
+        item_id = self.tree.insert(
+            "",
+            "end",
+            values=(
+                recruiter.id,
+                recruiter.company,
+                recruiter.full_name,
+                recruiter.telegram,
+                recruiter.phone,
+                recruiter.position,
+                recruiter.email,
+                recruiter.status or "",
+                recruiter.last_contact or "",
+                recruiter.next_step or "",
+                recruiter.comment_preview(),
+            ),
+        )
+        self.tree.item(item_id, tags=("email",))
+
+    def _get_selected_recruiter(self) -> Recruiter | None:
         selection = self.tree.selection()
         if not selection:
             messagebox.showwarning("Нет выбора", "Выберите рекрутера в таблице.")
@@ -519,151 +667,60 @@ class CRMApp:
         values = item["values"]
         if not values:
             return None
-        # Берем id и вытягиваем полные данные из БД, чтобы не использовать усечённый комментарий из таблицы
         try:
             recruiter_id = int(values[0])
         except (TypeError, ValueError):
             recruiter_id = None
-        row_full = self.db.get_recruiter(recruiter_id) if recruiter_id else None
-        if row_full:
-            return {
-                "id": row_full["id"],
-                "company": row_full["company"],
-                "full_name": row_full["full_name"],
-                "telegram": row_full["telegram"],
-                "phone": row_full["phone"],
-                "position": row_full["position"],
-                "email": row_full["email"],
-                "status": row_full["status"],
-                "last_contact": row_full["last_contact"],
-                "next_step": row_full["next_step"],
-                "comments": row_full["comments"],
-            }
-        # Фолбек: если по какой-то причине не нашли в БД — используем данные из таблицы (могут быть усечены)
-        keys = [
-            "id",
-            "company",
-            "full_name",
-            "telegram",
-            "phone",
-            "position",
-            "email",
-            "status",
-            "last_contact",
-            "next_step",
-            "comments",
-        ]
-        return dict(zip(keys, values))
+        recruiter = self.repo.get(recruiter_id) if recruiter_id else None
+        if recruiter:
+            return recruiter
+        return Recruiter(
+            id=recruiter_id,
+            company=values[1],
+            full_name=values[2],
+            telegram=values[3],
+            phone=values[4],
+            position=values[5],
+            email=values[6],
+            status=values[7],
+            last_contact=values[8],
+            next_step=values[9],
+            comments=values[10],
+        )
 
-    def _fill_form_from_row(self, row: dict) -> None:
-        self.current_edit_id = int(row["id"])
-        self.company_var.set(row.get("company", ""))
-        self.full_name_var.set(row.get("full_name", ""))
-        self.telegram_var.set(row.get("telegram", ""))
-        self.phone_var.set(row.get("phone", ""))
-        self.position_var.set(row.get("position", ""))
-        self.email_var.set(row.get("email", ""))
-        self.status_var.set(row.get("status", "") or "первичный контакт")
-        self.last_contact_var.set(row.get("last_contact", "") or "")
-        self.next_step_var.set(row.get("next_step", "") or "")
+    def _fill_form(self, recruiter: Recruiter) -> None:
+        self.current_edit_id = recruiter.id
+        self.current_resume_path = recruiter.resume_path
+        self.company_var.set(recruiter.company)
+        self.full_name_var.set(recruiter.full_name)
+        self.telegram_var.set(recruiter.telegram)
+        self.phone_var.set(recruiter.phone)
+        self.position_var.set(recruiter.position)
+        self.email_var.set(recruiter.email)
+        self.status_var.set(recruiter.status or DEFAULT_STATUS)
+        self.last_contact_var.set(recruiter.last_contact or "")
+        self.next_step_var.set(recruiter.next_step or "")
         self.comments_text.delete("1.0", tk.END)
-        self.comments_text.insert("1.0", row.get("comments", "") or "")
+        self.comments_text.insert("1.0", recruiter.comments or "")
 
-    def _fill_form_from_row(self, row: dict) -> None:
-        self.current_edit_id = int(row["id"])
-        self.company_var.set(row.get("company", ""))
-        self.full_name_var.set(row.get("full_name", ""))
-        self.telegram_var.set(row.get("telegram", ""))
-        self.phone_var.set(row.get("phone", ""))
-        self.position_var.set(row.get("position", ""))
-        self.email_var.set(row.get("email", ""))
-        self.status_var.set(row.get("status", "") or "первичный контакт")
-        self.last_contact_var.set(row.get("last_contact", "") or "")
-        self.next_step_var.set(row.get("next_step", "") or "")
-        self.comments_text.delete("1.0", tk.END)
-        self.comments_text.insert("1.0", row.get("comments", "") or "")
-
-    def on_tree_double_click(self, event) -> None:
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
+    def on_tree_double_click(self, event: tk.Event) -> None:
+        if self.tree.identify("region", event.x, event.y) != "cell":
             return
-        col_id = self.tree.identify_column(event.x)
-        col_index = int(col_id.replace("#", "")) - 1
-        col_name = self.tree["columns"][col_index]
+        col_name = self.tree["columns"][int(self.tree.identify_column(event.x).replace("#", "")) - 1]
         if col_name == "telegram":
             self.open_tg()
         elif col_name == "email":
             self.open_email()
         else:
-            row = self._get_selected_row()
-            if row:
-                self._fill_form_from_row(row)
-
-    def _pick_date(self, target_var: tk.StringVar) -> None:
-        """Простая модалка-календарь без внешних зависимостей."""
-        top = tk.Toplevel(self.root)
-        top.title("Выбор даты")
-        top.grab_set()
-        top.resizable(False, False)
-
-        today = datetime.date.today()
-        current = {"year": today.year, "month": today.month}
-
-        header = ttk.Frame(top, padding=6)
-        header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(1, weight=1)
-
-        month_label = ttk.Label(header, text="")
-        month_label.grid(row=0, column=1)
-
-        def render():
-            month_label.config(text=f"{calendar.month_name[current['month']]} {current['year']}")
-            for w in body.winfo_children():
-                w.destroy()
-            week_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-            for idx, name in enumerate(week_names):
-                ttk.Label(body, text=name, width=4, anchor="center").grid(row=0, column=idx, padx=1, pady=1)
-            weeks = calendar.monthcalendar(current["year"], current["month"])
-            for r, week in enumerate(weeks, start=1):
-                for c, day in enumerate(week):
-                    if day == 0:
-                        ttk.Label(body, text=" ", width=4).grid(row=r, column=c, padx=1, pady=1)
-                    else:
-                        def select(d=day):
-                            date_str = f"{current['year']:04d}-{current['month']:02d}-{d:02d}"
-                            target_var.set(date_str)
-                            top.destroy()
-                        ttk.Button(body, text=str(day), width=4, command=select).grid(row=r, column=c, padx=1, pady=1)
-
-        def prev_month():
-            if current["month"] == 1:
-                current["month"] = 12
-                current["year"] -= 1
-            else:
-                current["month"] -= 1
-            render()
-
-        def next_month():
-            if current["month"] == 12:
-                current["month"] = 1
-                current["year"] += 1
-            else:
-                current["month"] += 1
-            render()
-
-        ttk.Button(header, text="<", width=3, command=prev_month).grid(row=0, column=0, padx=2)
-        ttk.Button(header, text=">", width=3, command=next_month).grid(row=0, column=2, padx=2)
-
-        body = ttk.Frame(top, padding=6)
-        body.grid(row=1, column=0, sticky="nsew")
-
-        render()
+            recruiter = self._get_selected_recruiter()
+            if recruiter:
+                self._fill_form(recruiter)
 
     def open_tg(self) -> None:
-        row = self._get_selected_row()
-        if not row:
+        recruiter = self._get_selected_recruiter()
+        if not recruiter:
             return
-        handle = (row.get("telegram") or "").strip().lstrip("@")
+        handle = recruiter.telegram.strip().lstrip("@")
         if not handle:
             messagebox.showwarning("TG", "У этого рекрутера не указан ник в Telegram.")
             return
@@ -679,42 +736,21 @@ class CRMApp:
             messagebox.showerror("Ошибка", f"Не удалось открыть Telegram: {exc}")
 
     def open_email(self) -> None:
-        row = self._get_selected_row()
-        if not row:
+        recruiter = self._get_selected_recruiter()
+        if not recruiter:
             return
-        email = (row.get("email") or "").strip()
+        email = recruiter.email.strip()
         if not email:
             messagebox.showwarning("Почта", "У этого рекрутера не указана почта.")
             return
         subject = "Вопрос по вакансии"
         try:
-            # Быстрый путь: всегда Gmail compose, чтобы не зависеть от mailto и браузерных handler'ов
             if USE_GMAIL_COMPOSE:
-                gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={email}&su={subject.replace(' ', '%20')}"
-                webbrowser.open(gmail_url)
-                logging.info("Gmail compose для %s", email)
+                self._open_gmail_compose(email, subject)
             else:
-                mailto = f"mailto:{email}?subject={subject}"
-                opened = False
-                if sys.platform.startswith("win"):
-                    try:
-                        os.startfile(mailto)  # type: ignore[attr-defined]
-                        opened = True
-                    except Exception:
-                        pass
-                    if not opened:
-                        try:
-                            subprocess.Popen(["cmd", "/c", "start", "", mailto], shell=True)
-                            opened = True
-                        except Exception:
-                            pass
+                opened = self._open_mailto(email, subject)
                 if not opened:
-                    opened = webbrowser.open(mailto)
-                logging.info("Открыт mailto для %s (opened=%s)", email, opened)
-                if not opened:
-                    gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={email}&su={subject.replace(' ', '%20')}"
-                    webbrowser.open(gmail_url)
-                    logging.info("Fallback Gmail compose для %s", email)
+                    self._open_gmail_compose(email, subject)
                     messagebox.showinfo(
                         "Почта",
                         "Не получилось открыть системный почтовый клиент.\nОткрыл Gmail compose в браузере.\n"
@@ -722,43 +758,72 @@ class CRMApp:
                     )
         except Exception as exc:
             logging.exception("Не удалось открыть почту: %s", exc)
-            messagebox.showerror(
-                "Почта",
-                f"Не удалось открыть почту.\nОшибка: {exc}\n"
-                f"Адрес: {email}",
-            )
+            messagebox.showerror("Почта", f"Не удалось открыть почту.\nОшибка: {exc}\nАдрес: {email}")
         finally:
+            self._copy_to_clipboard(email)
+
+    def _open_gmail_compose(self, email: str, subject: str) -> None:
+        gmail_url = f"https://mail.google.com/mail/?view=cm&fs=1&to={email}&su={subject.replace(' ', '%20')}"
+        webbrowser.open(gmail_url)
+        logging.info("Gmail compose для %s", email)
+
+    def _open_mailto(self, email: str, subject: str) -> bool:
+        mailto = f"mailto:{email}?subject={subject}"
+        opened = False
+        if sys.platform.startswith("win"):
             try:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(email)
+                os.startfile(mailto)  # type: ignore[attr-defined]
+                opened = True
             except Exception:
                 pass
+            if not opened:
+                try:
+                    subprocess.Popen(["cmd", "/c", "start", "", mailto], shell=True)
+                    opened = True
+                except Exception:
+                    pass
+        if not opened:
+            opened = webbrowser.open(mailto)
+        logging.info("Открыт mailto для %s (opened=%s)", email, opened)
+        return opened
 
+    def _copy_to_clipboard(self, text: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
 
     def delete_recruiter(self) -> None:
-        row = self._get_selected_row()
-        if not row:
+        recruiter = self._get_selected_recruiter()
+        if not recruiter:
             return
         confirm = messagebox.askyesno(
             "Удалить",
-            f"Удалить рекрутера {row['full_name']} из {row['company']}?",
+            f"Удалить рекрутера {recruiter.full_name} из {recruiter.company}?",
             icon="warning",
         )
         if not confirm:
             return
         try:
-            self.db.delete_recruiter(int(row["id"]))
-            logging.info("Удален рекрутер id=%s", row["id"])
+            self.repo.delete(int(recruiter.id))  # type: ignore[arg-type]
+            logging.info("Удален рекрутер id=%s", recruiter.id)
             self._refresh_table()
             self._refresh_company_filter()
         except Exception as exc:
             logging.exception("Ошибка при удалении: %s", exc)
             messagebox.showerror("Ошибка", f"Не удалось удалить: {exc}")
 
+    def _on_close(self) -> None:
+        try:
+            self.repo.close()
+        finally:
+            self.root.destroy()
+
 
 def main() -> None:
     setup_logging()
-    logging.info("Запуск приложения")
+    logging.info("Запуск приложения версии %s", APP_VERSION)
     root = tk.Tk()
     CRMApp(root)
     root.mainloop()
